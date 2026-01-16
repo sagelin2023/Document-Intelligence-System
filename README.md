@@ -1,2 +1,4 @@
-# Document-Intelligence-System
-Python script that takes PDFs and answers questions about the pdf from the user
+python -m venv .venv
+source .venv/Scripts/activate
+pip install -r requirements.txt
+uvicorn backend.main:app --reload

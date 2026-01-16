@@ -1,0 +1,17 @@
+# Python cache files
+__pycache__/
+*.pyc
+
+# Virtual environment
+.venv/
+
+# Environment variables
+.env
+
+# Project data (generated at runtime)
+data/uploads/
+data/index/
+
+# OS-specific files
+.DS_Store
+Thumbs.db
