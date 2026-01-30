@@ -1,9 +1,16 @@
+from __future__ import annotations
+
 from fastapi import FastAPI, UploadFile, File, HTTPException
 from pathlib import Path
 import pdfplumber, uuid, json
+from pydantic import BaseModel
+
+from backend.rag.indexing import build_index_for_doc
+from backend.rag.retrieval import search_doc
+
 
 app = FastAPI()
-UPLOAD_DIR = Path("data/uploads") 
+UPLOAD_DIR = Path("data/uploads") #directory to save the uploaded files
 UPLOAD_DIR.mkdir(parents=True, exist_ok=True)#ensure the upload directory exists
 INDEX_DIR = Path("data/index")
 INDEX_DIR.mkdir(parents=True, exist_ok=True)#ensure the index directory exists
@@ -46,33 +53,46 @@ async def upload_pdf(file: UploadFile = File(...)):
     with open(save_path, "wb") as out: #opens the file at the path in write-binary mode and name it out
         #reads the file in chunks until there is no more data
         while True:
-            chunk = await file.read(1024 * 1024)  # Read in 1 MB chunks
-            if not chunk: #if no more data is left
+            buf = await file.read(1024 * 1024)  # (CHANGED variable name) Read in 1 MB chunks
+            if not buf: #if no more data is left
                 break
-            out.write(chunk) #writes the chunk to the file
-            bytes_saved += len(chunk) #updates the byte counter
+            out.write(buf) #writes the chunk to the file
+            bytes_saved += len(buf) #updates the byte counter
     
 
     page_texts = [] #list to hold the text from each page
     chunks = [] #list to hold the text chunks
     chunk_id = 0 #unique identifier for each chunk
-    with pdfplumber.open(save_path) as pdf: #opens the saved pdf file
-        pages = len(pdf.pages) #number of pages in the pdf
-        page_number = 1
-        for page in pdf.pages:
-            text = page.extract_text()
-            if not text: #if there is no text on the page
-                text = ""
-            page_texts.append(text) #adds the text to the list
-            for chunk in chunk_text(text, CHUNK_SIZE, OVERLAP): #for each chunk on the page
-                chunks.append({
-                    "doc_id": doc_id,
-                    "chunk_id": chunk_id,
-                    "page_number": page_number,
-                    "text": chunk
-                })
-                chunk_id += 1
-            page_number += 1 #increment the page number 
+    
+    try:
+        with pdfplumber.open(save_path) as pdf: #opens the saved pdf file
+            pages = len(pdf.pages) #number of pages in the pdf
+            page_number = 1
+            for page in pdf.pages:
+                text = page.extract_text()
+                if not text: #if there is no text on the page
+                    text = ""
+                page_texts.append(text) #adds the text to the list
+                for chunk in chunk_text(text, CHUNK_SIZE, OVERLAP): #for each chunk on the page
+
+                    # This improves retrieval quality and reduces wasted vectors.
+                    if len(chunk.strip()) < 30:
+                        continue
+
+                    chunk_uid = f"{doc_id}_{chunk_id:05d}" #unique identifier for the chunk
+
+                    chunks.append({
+                        "doc_id": doc_id,
+                        "chunk_id": chunk_id,
+                        "chunk_uid": chunk_uid,   # (ADDED - Phase 3)
+                        "page_number": page_number,
+                        "text": chunk
+                    })
+                    chunk_id += 1
+                page_number += 1 #increment the page number
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"PDF processing failed: {e}")
+
     full_text = "\n".join(page_texts) #joins all the text parts into a single string
     chars_extracted = len(full_text)
     preview = full_text[:500]  # First 500 characters as preview
@@ -89,6 +109,7 @@ async def upload_pdf(file: UploadFile = File(...)):
 
     #printing chunk summary to console
     print("doc_id:", doc_id)
+    print("bytes_saved:", bytes_saved) 
     print("total_chunks:", total_chunks)
     print("avg_chunk_length:", avg_len)
     if total_chunks:
@@ -101,13 +122,48 @@ async def upload_pdf(file: UploadFile = File(...)):
         "pages": pages,
         "chars_extracted": chars_extracted,
         "preview": preview,
-        "total_chunks": len(chunks)
+        "total_chunks": len(chunks),
+        "index_built": False  
     }
 
+
+# This reads chunks.json, embeds the chunks, builds FAISS, and saves index.faiss (+ meta.json).
+@app.post("/index/{doc_id}")
+def index_doc(doc_id: str):
+
+    try:
+        stats = build_index_for_doc(doc_id, write_meta=True)
+        return {
+            "doc_id": doc_id,
+            "total_chunks_loaded": stats.total_chunks_loaded,
+            "total_chunks_indexed": stats.total_chunks_indexed,
+            "embedding_dim": stats.embedding_dim,
+            "index_built": True  
+        }
+    except FileNotFoundError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# This forces the client to send doc_id + query and optionally k.
+class SearchRequest(BaseModel):
+    doc_id: str
+    query: str
+    k: int = 5
+
+
+# This is the Phase 3 deliverable: returns top-k chunks + similarity scores.
 @app.post("/search")
-async def search_document():
-    return {
-        "query": "...",
-        "k": 5,
-        "doc_id": "...:"
-    }
+def search(req: SearchRequest):
+
+    try:
+        return search_doc(req.doc_id, req.query, req.k)
+    except FileNotFoundError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
