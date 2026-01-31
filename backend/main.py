@@ -7,6 +7,11 @@ from pydantic import BaseModel
 
 from backend.rag.indexing import build_index_for_doc
 from backend.rag.retrieval import search_doc
+from typing import List, Optional, Dict, Any
+from backend.rag.answering import answer_with_citations
+
+
+
 
 
 app = FastAPI()
@@ -16,6 +21,7 @@ INDEX_DIR = Path("data/index")
 INDEX_DIR.mkdir(parents=True, exist_ok=True)#ensure the index directory exists
 CHUNK_SIZE = 1200
 OVERLAP = 200
+
 
 def chunk_text(text, chunk_size, overlap):
     if chunk_size <= 0:
@@ -164,6 +170,61 @@ def search(req: SearchRequest):
     except FileNotFoundError as e:
         raise HTTPException(status_code=404, detail=str(e))
     except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+
+
+class AskRequest(BaseModel):
+    doc_id: str
+    question: str
+    k: int = 5
+    include_retrieved_chunks: bool = False  # optional debug
+
+
+class Citation(BaseModel):
+    chunk_id: str
+    page: int
+    snippet: str
+
+
+class AskResponse(BaseModel):
+    answer: str
+    citations: List[Citation]
+    retrieved_chunks: Optional[List[Dict[str, Any]]] = None
+
+
+@app.post("/ask", response_model=AskResponse)
+def ask(req: AskRequest):
+
+    try:
+        # 1) retrieve
+        retrieved = search_doc(req.doc_id, req.question, req.k)
+        results = retrieved.get("results", [])
+
+        if not results:
+            return AskResponse(
+                answer="I don't know based on the provided sources.",
+                citations=[],
+                retrieved_chunks=[] if req.include_retrieved_chunks else None,
+            )
+
+        # 2) LLM answer grounded in retrieved chunks
+        llm_out = answer_with_citations(req.question, results)
+
+        # 3) return
+        return AskResponse(
+            answer=llm_out["answer"],
+            citations=[Citation(**c) for c in llm_out["citations"]],
+            retrieved_chunks=results if req.include_retrieved_chunks else None,
+        )
+
+    except FileNotFoundError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except ValueError as e:
+        # catches: empty question, bad k, or "LLM cited unknown chunk_id"
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
